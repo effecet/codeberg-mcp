@@ -1,0 +1,8 @@
+.env
+.env.ci-secrets
+__pycache__/
+*.pyc
+.venv/
+.venv-test/
+.pytest_cache/
+.ruff_cache/
