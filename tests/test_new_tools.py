@@ -546,7 +546,6 @@ async def test_list_repo_secrets_empty_repo(mcp_client, respx_mock):
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 2 expansion — 20 new tools across 7 feature areas
-# Spec/plan: ~/.claude/specs/2026-05-12-codeberg-mcp-expansion-2{,_plan}.md
 # ═══════════════════════════════════════════════════════════════════════════
 
 

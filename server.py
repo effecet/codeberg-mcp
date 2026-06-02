@@ -1074,8 +1074,7 @@ async def list_workflow_runs(
     if status:
         params["status"] = status
     # Use /actions/runs (not /actions/tasks) — the tasks endpoint hides
-    # runs that are still in `waiting` status. See reference_codeberg_actions_quirks.md
-    # § "Runs vs tasks — Forgejo endpoint split". Fixed 2026-04-19.
+    # runs that are still in `waiting` status (Forgejo runs-vs-tasks split).
     r = await client.get(
         f"/repos/{owner}/{repo}/actions/runs", headers=auth, params=params
     )
@@ -1556,9 +1555,10 @@ async def list_repo_secrets(
     List the names of Forgejo Actions secrets configured on a repository.
 
     The Forgejo API exposes secret names and creation timestamps but never
-    the values (write-only). To set or delete a secret, use the curl recipe
-    documented in `reference_codeberg_secrets_api.md` — the MCP intentionally
-    omits write-side secret tools to keep credentials out of transcripts.
+    the values (write-only). To set or delete a secret, call the Forgejo API
+    directly (PUT/DELETE `/repos/{owner}/{repo}/actions/secrets/{name}`) — the
+    MCP intentionally omits write-side secret tools to keep credentials out of
+    transcripts.
 
     Args:
         owner:   Repository owner.
@@ -1585,7 +1585,6 @@ async def list_repo_secrets(
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 2 expansion — 20 new tools across 7 feature areas
-# Spec/plan: ~/.claude/specs/2026-05-12-codeberg-mcp-expansion-2{,_plan}.md
 # ═══════════════════════════════════════════════════════════════════════════
 
 
