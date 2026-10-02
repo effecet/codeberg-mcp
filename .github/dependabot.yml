@@ -9,6 +9,11 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "[deps]"
+    ignore:
+      # mcp 2.x renamed FastMCP (mcp.server.fastmcp -> mcp.server.mcpserver) and
+      # changed other APIs; requirements.txt pins <2 on purpose. Migrate deliberately.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
     groups:
       pip-dependencies:
         patterns:
