@@ -6,6 +6,9 @@ on:
     - cron: "0 6 * * 1"  # weekly, Mondays 06:00 UTC: keeps the badge honest against dependency drift
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   lint-test:
     runs-on: ubuntu-latest
