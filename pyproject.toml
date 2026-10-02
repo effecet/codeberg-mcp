@@ -1,3 +1,10 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Declared explicitly instead of inherited from ruff's defaults. ruff 0.16 widened
+# the default rule set, which turned CI red on files nobody had touched. This is
+# the pre-0.16 default (pycodestyle errors + Pyflakes), written down so a ruff
+# upgrade can no longer redefine the lint contract silently.
+select = ["E4", "E7", "E9", "F"]
