@@ -133,7 +133,7 @@ answer, so a write may still have landed: check state before retrying.
 
 ```bash
 pip install -r requirements.txt
-pytest -q          # 128 tests (respx-mocked, no network)
+pytest -q          # 130 tests (respx-mocked, no network)
 ruff check .
 ruff format --check .
 ```
