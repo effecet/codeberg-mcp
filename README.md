@@ -28,7 +28,7 @@ them instead of crashing.
 ```mermaid
 flowchart LR
     Agent[MCP client<br/>Claude Code / claude.ai]
-    Server[codeberg-mcp<br/>FastMCP server.py]
+    Server[codeberg-mcp<br/>MCPServer server.py]
     Accounts[(CODEBERG_ACCOUNTS<br/>name -> token)]
     API[(Codeberg / Forgejo<br/>Gitea REST API v1)]
 
@@ -112,17 +112,28 @@ account (token) to use.
 On any API failure a tool returns, instead of its normal result:
 
 ```json
-{"error": "Codeberg API <status>: <detail>", "status": <int>}
+{"error": "Codeberg API <status>: <detail>", "status": <int|null>}
 ```
 
-Treat any result with top-level `error` and `status` keys as a failure. This
-holds even for tools that normally return a list.
+Treat any result with top-level `error` and `status` keys as a failure. Tools
+that normally return a list or text (or nothing) cannot return that object, so
+they report an error result (`isError: true`) whose text is
+`Error executing tool <name>: ` followed by the same JSON.
+
+Caller mistakes the caller can fix (unknown account, a directory passed to
+`get_file`, an invalid merge method) come back as an error result with the
+guidance as text. Any other failure inside a tool is a bug, and the client sees
+only `Error executing tool <name>`.
+
+If Codeberg cannot be reached at all (timeout, refused or dropped connection),
+`status` is `null` and `error` names the transport failure. There was no HTTP
+answer, so a write may still have landed: check state before retrying.
 
 ## Development
 
 ```bash
 pip install -r requirements.txt
-pytest -q          # 110 tests (respx-mocked, no network)
+pytest -q          # 128 tests (respx-mocked, no network)
 ruff check .
 ruff format --check .
 ```

@@ -274,7 +274,7 @@ async def test_get_workflow_run_raises_when_not_found(mcp_client, respx_mock):
     respx_mock.get("/repos/example/demo-repo/actions/runs/999").mock(
         return_value=httpx.Response(404, json={"message": "Not found"})
     )
-    with pytest.raises(ValueError, match="run_id=999 not found"):
+    with pytest.raises(server.ToolUsageError, match="run_id=999 not found"):
         await server.get_workflow_run(owner="example", repo="demo-repo", run_id=999)
 
 
@@ -586,11 +586,13 @@ async def test_list_pull_files_returns_file_entries(mcp_client, respx_mock):
     assert result[1]["status"] == "added"
 
 
-async def test_list_pull_files_error_surfaces_404(mcp_client, respx_mock):
+async def test_list_pull_files_error_surfaces_404(mcp_client, respx_mock, tool_error):
     respx_mock.get("/repos/example/nope/pulls/1/files").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
-    result = await server.list_pull_files(owner="example", repo="nope", index=1)
+    result = await tool_error(
+        server.list_pull_files(owner="example", repo="nope", index=1)
+    )
     assert result["status"] == 404
     assert "404" in result["error"]
 
@@ -621,11 +623,13 @@ async def test_list_pull_commits_returns_commit_entries(mcp_client, respx_mock):
     assert result[0]["author"] == "example"
 
 
-async def test_list_pull_commits_error_surfaces_404(mcp_client, respx_mock):
+async def test_list_pull_commits_error_surfaces_404(mcp_client, respx_mock, tool_error):
     respx_mock.get("/repos/example/nope/pulls/1/commits").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
-    result = await server.list_pull_commits(owner="example", repo="nope", index=1)
+    result = await tool_error(
+        server.list_pull_commits(owner="example", repo="nope", index=1)
+    )
     assert result["status"] == 404
     assert "404" in result["error"]
 
@@ -655,11 +659,13 @@ async def test_list_pull_reviews_returns_review_entries(mcp_client, respx_mock):
     assert result[0]["user"] == "example"
 
 
-async def test_list_pull_reviews_error_surfaces_404(mcp_client, respx_mock):
+async def test_list_pull_reviews_error_surfaces_404(mcp_client, respx_mock, tool_error):
     respx_mock.get("/repos/example/nope/pulls/1/reviews").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
-    result = await server.list_pull_reviews(owner="example", repo="nope", index=1)
+    result = await tool_error(
+        server.list_pull_reviews(owner="example", repo="nope", index=1)
+    )
     assert result["status"] == 404
     assert "404" in result["error"]
 
@@ -896,12 +902,16 @@ async def test_remove_issue_label_returns_none_on_204(mcp_client, respx_mock):
     assert result is None
 
 
-async def test_remove_issue_label_404_when_not_applied(mcp_client, respx_mock):
+async def test_remove_issue_label_404_when_not_applied(
+    mcp_client, respx_mock, tool_error
+):
     respx_mock.delete("/repos/example/demo-repo/issues/3/labels/99").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
-    result = await server.remove_issue_label(
-        owner="example", repo="demo-repo", index=3, label_id=99
+    result = await tool_error(
+        server.remove_issue_label(
+            owner="example", repo="demo-repo", index=3, label_id=99
+        )
     )
     assert result["status"] == 404
     assert "404" in result["error"]
@@ -1242,12 +1252,16 @@ async def test_create_actions_variable_posts_value(mcp_client, respx_mock):
     assert result is None
 
 
-async def test_create_actions_variable_409_on_existing(mcp_client, respx_mock):
+async def test_create_actions_variable_409_on_existing(
+    mcp_client, respx_mock, tool_error
+):
     respx_mock.post("/repos/example/demo-repo/actions/variables/IMAGE_TAG").mock(
         return_value=httpx.Response(409, json={"message": "variable already exists"})
     )
-    result = await server.create_actions_variable(
-        owner="example", repo="demo-repo", name="IMAGE_TAG", value="v3"
+    result = await tool_error(
+        server.create_actions_variable(
+            owner="example", repo="demo-repo", name="IMAGE_TAG", value="v3"
+        )
     )
     assert result["status"] == 409
     assert "409" in result["error"]
@@ -1273,12 +1287,16 @@ async def test_update_actions_variable_puts_value(mcp_client, respx_mock):
     assert result is None
 
 
-async def test_update_actions_variable_404_when_missing(mcp_client, respx_mock):
+async def test_update_actions_variable_404_when_missing(
+    mcp_client, respx_mock, tool_error
+):
     respx_mock.put("/repos/example/demo-repo/actions/variables/MISSING").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
-    result = await server.update_actions_variable(
-        owner="example", repo="demo-repo", name="MISSING", value="x"
+    result = await tool_error(
+        server.update_actions_variable(
+            owner="example", repo="demo-repo", name="MISSING", value="x"
+        )
     )
     assert result["status"] == 404
     assert "404" in result["error"]

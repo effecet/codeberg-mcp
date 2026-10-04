@@ -10,8 +10,9 @@ updates:
     commit-message:
       prefix: "[deps]"
     ignore:
-      # mcp 2.x renamed FastMCP (mcp.server.fastmcp -> mcp.server.mcpserver) and
-      # changed other APIs; requirements.txt pins <2 on purpose. Migrate deliberately.
+      # A major mcp bump has broken the server before (2.x renamed FastMCP and
+      # changed how tool errors reach the client); requirements.txt pins <3 on
+      # purpose. Migrate deliberately.
       - dependency-name: "mcp"
         update-types: ["version-update:semver-major"]
     groups:

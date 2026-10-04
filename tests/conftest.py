@@ -13,11 +13,28 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Make the server module importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server  # noqa: E402
+
+
+@pytest.fixture
+def tool_error():
+    """Await a non-dict tool expected to fail; return its error JSON.
+
+    catch_api_errors raises a ToolError carrying the JSON for tools whose
+    result is not a dict (list, str, None).
+    """
+
+    async def _await(coro) -> dict:
+        with pytest.raises(ToolError) as ei:
+            await coro
+        return json.loads(str(ei.value))
+
+    return _await
 
 
 @pytest.fixture
@@ -33,7 +50,7 @@ def fake_accounts(monkeypatch):
 async def mcp_client(fake_accounts):
     """Initialize the shared httpx client + account globals the way _lifespan does.
 
-    We avoid running the real _lifespan (which also wires FastMCP); instead we
+    We avoid running the real _lifespan (which also wires MCPServer); instead we
     inject the module-level state test code needs.
     """
     server._accounts = fake_accounts
