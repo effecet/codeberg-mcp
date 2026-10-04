@@ -26,6 +26,7 @@ Tools:
 
 import base64
 import functools
+import inspect
 import json
 import os
 from contextlib import asynccontextmanager
@@ -36,7 +37,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
 import httpx  # noqa: E402
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 # ── server ──────────────────────────────────────────────────────────────────
 
@@ -83,6 +85,16 @@ async def _lifespan(server):
     _accounts = json.loads(raw)
     if not _accounts:
         raise RuntimeError("CODEBERG_ACCOUNTS is empty.")
+    # A stray newline or space in a token makes httpx raise an error whose
+    # message repeats the whole Authorization header. Strip, then refuse
+    # anything that is not printable ASCII so that error can never happen.
+    _accounts = {name: str(tok).strip() for name, tok in _accounts.items()}
+    for name, tok in _accounts.items():
+        if not tok or any(not 0x21 <= ord(c) <= 0x7E for c in tok):
+            raise RuntimeError(
+                f"CODEBERG_ACCOUNTS: token for '{name}' is empty or has "
+                "whitespace/control characters."
+            )
 
     # Default to CODEBERG_DEFAULT_ACCOUNT, else the first configured account.
     _default_account = os.environ.get("CODEBERG_DEFAULT_ACCOUNT") or next(
@@ -110,7 +122,7 @@ async def _lifespan(server):
         _client = None
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "codeberg",
     instructions=(
         "Interact with Codeberg repositories, files, pull requests, and branches "
@@ -121,10 +133,13 @@ mcp = FastMCP(
         "commit message. update_file and delete_file require the current file "
         "sha — call get_file first. merge_pull supports merge, rebase, and squash. "
         "ERROR CONTRACT: on any Codeberg API failure a tool returns "
-        '{"error": "Codeberg API <status>: <detail>", "status": <int>} '
-        "instead of its normal result (including tools that normally return a "
-        "list). Treat any result containing top-level 'error' and 'status' "
-        "keys as a failure and read 'error' for the reason."
+        '{"error": "Codeberg API <status>: <detail>", "status": <int|null>} '
+        "instead of its normal result. Tools that normally return a list, text "
+        "or nothing report it as an error result instead, its text being "
+        "'Error executing tool <name>: ' followed by that JSON. Treat any "
+        "result containing top-level 'error' and 'status' keys as a failure and read 'error' for the reason. A null 'status' "
+        "means Codeberg could not be reached (timeout or dropped connection), "
+        "so a write may still have landed: check state before retrying."
     ),
     lifespan=_lifespan,
 )
@@ -137,10 +152,19 @@ def _get_client(account: str | None = None) -> tuple[httpx.AsyncClient, dict]:
     name = account or _default_account
     token = _accounts.get(name)
     if not token:
-        raise RuntimeError(
+        raise ToolUsageError(
             f"Unknown account '{name}'. Available: {', '.join(_accounts.keys())}"
         )
     return _client, {"Authorization": f"token {token}"}
+
+
+class ToolUsageError(ToolError):
+    """A caller mistake the caller can fix (unknown account, wrong path kind).
+
+    mcp 2.x withholds the text of most exceptions a tool raises, but passes
+    a ToolError's message through as an is_error result, so the guidance
+    reaches the caller.
+    """
 
 
 class CodebergAPIError(RuntimeError):
@@ -181,7 +205,7 @@ def _raise(response: httpx.Response) -> None:
     """Raise CodebergAPIError on non-2xx responses.
 
     The decorator turns this into a structured error result so the message
-    reaches Claude instead of being eaten by FastMCP's wrapper.
+    reaches Claude instead of being eaten by MCPServer's wrapper.
     """
     if response.is_success:
         return
@@ -200,21 +224,44 @@ def _safe_list(value: object) -> list:
 
 
 def catch_api_errors(fn):
-    """Convert CodebergAPIError into a structured tool result.
+    """Convert API and transport errors into a structured tool result.
 
-    Applied UNDER `@mcp.tool()` so FastMCP introspects the original
+    Applied UNDER `@mcp.tool()` so MCPServer introspects the original
     signature (functools.wraps preserves it). API errors become
     `{"error": str(e), "status": e.status}` — the message reaches the
-    caller instead of being swallowed. Non-API
-    exceptions (programming bugs) propagate unchanged.
+    caller instead of being swallowed. Transport errors (timeout, refused
+    or dropped connection) get `"status": None`: there was no HTTP answer,
+    so a write may or may not have landed.
+
+    Tools annotated `-> dict` return that dict. Any other tool (`list[dict]`,
+    `str`) has an output schema the dict would fail, so the same JSON is
+    raised as a ToolError instead: mcp 2.x passes its text through as an
+    is_error result. Other exceptions (programming bugs) propagate, and mcp
+    2.x reports them as a bare "Error executing tool".
     """
+    returns_dict = inspect.signature(fn).return_annotation is dict
+
+    def _result(error: dict) -> dict:
+        if returns_dict:
+            return error
+        raise ToolError(json.dumps(error))
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         try:
             return await fn(*args, **kwargs)
         except CodebergAPIError as e:
-            return {"error": str(e), "status": e.status}
+            return _result({"error": str(e), "status": e.status})
+        except httpx.TransportError as e:
+            # LocalProtocolError's message can quote a request header, which
+            # here means the token: name the error class only.
+            detail = "" if isinstance(e, httpx.LocalProtocolError) else f": {e}"
+            return _result(
+                {
+                    "error": f"Codeberg unreachable ({type(e).__name__}){detail}",
+                    "status": None,
+                }
+            )
 
     return wrapper
 
@@ -435,7 +482,7 @@ async def get_file(
     data = r.json()
 
     if data.get("type") == "dir":
-        raise ValueError(
+        raise ToolUsageError(
             f"'{path}' is a directory. Use list_dir to browse directories."
         )
 
@@ -647,7 +694,9 @@ async def list_dir(
     data = r.json()
 
     if isinstance(data, dict):
-        raise ValueError(f"'{path}' is a file, not a directory. Use get_file instead.")
+        raise ToolUsageError(
+            f"'{path}' is a file, not a directory. Use get_file instead."
+        )
 
     return [
         {
@@ -834,7 +883,7 @@ async def merge_pull(
         Dict with merged status and method used.
     """
     if method not in ("merge", "rebase", "squash"):
-        raise ValueError(
+        raise ToolUsageError(
             f"Invalid merge method '{method}'. Use 'merge', 'rebase', or 'squash'."
         )
 
@@ -1130,7 +1179,7 @@ async def get_workflow_run(
     client, auth = _get_client(account)
     r = await client.get(f"/repos/{owner}/{repo}/actions/runs/{run_id}", headers=auth)
     if r.status_code == 404:
-        raise ValueError(
+        raise ToolUsageError(
             f"run_id={run_id} not found on {owner}/{repo}. "
             f"Use list_workflow_runs first to find valid IDs."
         )

@@ -35,7 +35,7 @@ def test_get_client_switches_account_when_specified(mcp_client):
 
 
 def test_get_client_rejects_unknown_account(mcp_client):
-    with pytest.raises(RuntimeError, match="Unknown account 'nobody'"):
+    with pytest.raises(server.ToolUsageError, match="Unknown account 'nobody'"):
         server._get_client(account="nobody")
 
 
@@ -178,7 +178,7 @@ async def test_get_file_rejects_directory(mcp_client, respx_mock):
     respx_mock.get("/repos/e/r/contents/src").mock(
         return_value=httpx.Response(200, json={"type": "dir"})
     )
-    with pytest.raises(ValueError, match="is a directory"):
+    with pytest.raises(server.ToolUsageError, match="is a directory"):
         await server.get_file(owner="e", repo="r", path="src")
 
 
@@ -326,7 +326,7 @@ async def test_list_dir_rejects_single_file(mcp_client, respx_mock):
     respx_mock.get("/repos/e/r/contents/README.md").mock(
         return_value=httpx.Response(200, json={"type": "file"})
     )
-    with pytest.raises(ValueError, match="is a file, not a directory"):
+    with pytest.raises(server.ToolUsageError, match="is a file, not a directory"):
         await server.list_dir(owner="e", repo="r", path="README.md")
 
 
@@ -450,7 +450,7 @@ async def test_merge_pull_accepts_valid_methods(mcp_client, respx_mock, method):
 
 
 async def test_merge_pull_rejects_invalid_method(mcp_client):
-    with pytest.raises(ValueError, match="Invalid merge method"):
+    with pytest.raises(server.ToolUsageError, match="Invalid merge method"):
         await server.merge_pull(owner="e", repo="r", index=1, method="force")
 
 

@@ -1,6 +1,7 @@
-# Pinned range: <1.10 SDKs dropped the exception message from ToolError,
-# surfacing empty errors. >=1.10 includes the detail in the message.
-mcp[cli]>=1.10,<2
+# mcp 2.x: FastMCP is now MCPServer. 2.x hides the text of exceptions a tool
+# raises, so catch_api_errors in server.py turns API and transport errors into
+# structured results instead of letting them propagate.
+mcp[cli]>=2.2.0,<3
 httpx>=0.28.1
 python-dotenv>=1.2.3
 uvicorn>=0.54.0

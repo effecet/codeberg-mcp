@@ -2,10 +2,10 @@
 
 - CodebergAPIError carries .status / .detail and subclasses RuntimeError
 - catch_api_errors decorator turns API errors into structured tool results
-  (the message reaches the caller instead of being eaten by FastMCP)
+  (the message reaches the caller instead of being eaten by MCPServer)
 - _safe_list guards Forgejo's `null` (not `[]`) collection fields
 - create_issue surfaces the smoke+PATCH workaround on oversized bodies
-- the decorator preserves FastMCP's generated input schema
+- the decorator preserves MCPServer's generated input schema
 """
 
 from __future__ import annotations
@@ -63,6 +63,25 @@ async def test_non_api_exception_still_propagates(mcp_client, respx_mock):
     )
     with pytest.raises(KeyError):
         await server.get_repo(owner="example", repo="x")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ReadTimeout("timed out"),
+    ],
+)
+async def test_transport_error_returns_structured_error_with_null_status(
+    mcp_client, respx_mock, exc
+):
+    # mcp 2.x hides the text of any exception a tool raises, so a network
+    # failure would reach the caller as a bare "Error executing tool".
+    # status is None: no HTTP answer, the outcome of a write is unknown.
+    respx_mock.get("/repos/example/x").mock(side_effect=exc)
+    result = await server.get_repo(owner="example", repo="x")
+    assert result["status"] is None
+    assert str(exc) in result["error"]
 
 
 # ── _safe_list null guard ───────────────────────────────────────────────────
@@ -159,7 +178,7 @@ async def test_create_issue_oversized_failure_surfaces_workaround(
     assert "PATCH" in result["error"]
 
 
-# ── decorator preserves FastMCP schema ──────────────────────────────────────
+# ── decorator preserves MCPServer schema ────────────────────────────────────
 
 
 def test_decorator_preserves_signature_and_schema():
@@ -169,10 +188,10 @@ def test_decorator_preserves_signature_and_schema():
     tools = asyncio.run(server.mcp.list_tools())
     assert len(tools) == 48  # +1: edit_issue (demo-repo#13)
     gi = next(t for t in tools if t.name == "get_issue")
-    assert set(gi.inputSchema["properties"]) == {
+    assert set(gi.input_schema["properties"]) == {
         "owner",
         "repo",
         "issue_number",
         "account",
     }
-    assert set(gi.inputSchema["required"]) == {"owner", "repo", "issue_number"}
+    assert set(gi.input_schema["required"]) == {"owner", "repo", "issue_number"}
