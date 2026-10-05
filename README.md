@@ -125,15 +125,24 @@ Caller mistakes the caller can fix (unknown account, a directory passed to
 guidance as text. Any other failure inside a tool is a bug, and the client sees
 only `Error executing tool <name>`.
 
-If Codeberg cannot be reached at all (timeout, refused or dropped connection),
-`status` is `null` and `error` names the transport failure. There was no HTTP
-answer, so a write may still have landed: check state before retrying.
+`status` is `null` when there is no definite answer: a timeout, a refused or
+dropped connection, a body that cannot be read, or a 502/503/504 from
+Codeberg's gateway (which has applied writes before failing the response). A
+write may still have landed, so check state before retrying.
+
+`create_pull` and `merge_pull` do that check themselves. When the response is
+lost they re-read the real state (open PRs for head→base; the PR's `merged`
+flag, re-read over a few seconds because it lags), and if the PR or merge is
+there they return success with `recovered_after_read_error: true` and the
+original error in `read_error`. Do not retry those. If the re-check cannot
+settle it, the result is still `status: null`. `merge_pull` also accepts
+`merge_title` and `merge_message` for the merge or squash commit.
 
 ## Development
 
 ```bash
 pip install -r requirements.txt
-pytest -q          # 130 tests (respx-mocked, no network)
+pytest -q          # 165 tests (respx-mocked, no network)
 ruff check .
 ruff format --check .
 ```

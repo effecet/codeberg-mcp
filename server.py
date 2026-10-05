@@ -24,6 +24,7 @@ Tools:
   Settings → set_repo_actions_enabled, list_repo_secrets
 """
 
+import asyncio
 import base64
 import functools
 import inspect
@@ -69,7 +70,9 @@ async def _validate_accounts() -> None:
                     f"account {name}: FAILED ({r.status_code} — token invalid?)"
                 )
         except Exception as e:
-            logger.warning(f"account {name}: FAILED (exception: {e})")
+            logger.warning(
+                f"account {name}: FAILED ({type(e).__name__}: {_error_text(e)})"
+            )
 
 
 @asynccontextmanager
@@ -137,9 +140,13 @@ mcp = MCPServer(
         "instead of its normal result. Tools that normally return a list, text "
         "or nothing report it as an error result instead, its text being "
         "'Error executing tool <name>: ' followed by that JSON. Treat any "
-        "result containing top-level 'error' and 'status' keys as a failure and read 'error' for the reason. A null 'status' "
-        "means Codeberg could not be reached (timeout or dropped connection), "
-        "so a write may still have landed: check state before retrying."
+        "result containing top-level 'error' and 'status' keys as a failure "
+        "and read 'error' for the reason. A null 'status' means the outcome is "
+        "UNKNOWN (timeout, dropped connection, unreadable body, or a "
+        "502/503/504 from Codeberg's gateway): a write may still have landed, "
+        "so check state before retrying. 'recovered_after_read_error: true' on "
+        "a create_pull or merge_pull success means the response was lost but "
+        "the PR or merge now exists: do not retry."
     ),
     lifespan=_lifespan,
 )
@@ -182,6 +189,22 @@ class CodebergAPIError(RuntimeError):
         super().__init__(f"Codeberg API {status}: {detail}")
 
 
+class OutcomeUnknownError(RuntimeError):
+    """A write whose result could not be determined, even after a re-check."""
+
+
+# Gateway errors from Codeberg's proxy: the backend may have applied the
+# write anyway (a 504 on POST /issues has created the issue regardless).
+_GATEWAY_STATUSES = frozenset({502, 503, 504})
+
+# A body that cannot be read as JSON: invalid JSON, or bytes that are not
+# UTF-8 (an HTML error page from a proxy, say). Neither is a definite answer.
+_UNREADABLE = (json.JSONDecodeError, UnicodeDecodeError)
+
+# Per-read timeout for the re-checks after a write whose outcome is unknown.
+_RECHECK_TIMEOUT = 5.0
+
+
 # Forgejo's POST /issues 500s above ~4k-char bodies (observed empirically
 # across sessions; see memory reference_codeberg_create_issue_workaround).
 # Soft limit — we still attempt, but annotate the result / error with the
@@ -199,6 +222,15 @@ def _detail(response: httpx.Response) -> str:
         return body.get("message") or body.get("error") or str(body)[:300]
     except Exception:
         return response.text[:300]
+
+
+def _json_message(response: httpx.Response) -> str:
+    """The body's `message` field, or '' when absent or unparseable."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    return (body.get("message") or "") if isinstance(body, dict) else ""
 
 
 def _raise(response: httpx.Response) -> None:
@@ -224,14 +256,15 @@ def _safe_list(value: object) -> list:
 
 
 def catch_api_errors(fn):
-    """Convert API and transport errors into a structured tool result.
+    """Convert API, transport and unknown-outcome errors into tool results.
 
     Applied UNDER `@mcp.tool()` so MCPServer introspects the original
     signature (functools.wraps preserves it). API errors become
     `{"error": str(e), "status": e.status}` — the message reaches the
-    caller instead of being swallowed. Transport errors (timeout, refused
-    or dropped connection) get `"status": None`: there was no HTTP answer,
-    so a write may or may not have landed.
+    caller instead of being swallowed. Gateway errors (502/503/504),
+    transport failures, unparseable bodies and unresolved writes become
+    `{"error": ..., "status": None}`: no definite answer, so a write may
+    or may not have landed.
 
     Tools annotated `-> dict` return that dict. Any other tool (`list[dict]`,
     `str`) has an output schema the dict would fail, so the same JSON is
@@ -251,19 +284,79 @@ def catch_api_errors(fn):
         try:
             return await fn(*args, **kwargs)
         except CodebergAPIError as e:
+            if e.status in _GATEWAY_STATUSES:
+                return _result({"error": _transport_error_message(e), "status": None})
             return _result({"error": str(e), "status": e.status})
-        except httpx.TransportError as e:
-            # LocalProtocolError's message can quote a request header, which
-            # here means the token: name the error class only.
-            detail = "" if isinstance(e, httpx.LocalProtocolError) else f": {e}"
-            return _result(
-                {
-                    "error": f"Codeberg unreachable ({type(e).__name__}){detail}",
-                    "status": None,
-                }
-            )
+        except OutcomeUnknownError as e:
+            return _result({"error": str(e), "status": None})
+        except (httpx.RequestError, *_UNREADABLE) as e:
+            return _result({"error": _transport_error_message(e), "status": None})
 
     return wrapper
+
+
+def _error_text(e: Exception) -> str:
+    """`str(e)`, except where the text can carry a request header.
+
+    LocalProtocolError's message can quote the rejected header value, which
+    here means the Authorization token: withhold it. Callers already name
+    the exception class.
+    """
+    if isinstance(e, httpx.LocalProtocolError):
+        return "detail withheld"
+    return str(e) or "no detail"
+
+
+def _transport_error_message(e: Exception) -> str:
+    """Name a failure that gave no definite answer."""
+    return (
+        f"No definite answer from Codeberg ({type(e).__name__}: "
+        f"{_error_text(e)}). If this was a write, it may have been "
+        "applied — check current state before retrying."
+    )
+
+
+def _is_outcome_unknown(e: Exception) -> bool:
+    """True when `e` leaves a sent write's result undetermined."""
+    if isinstance(e, (httpx.RequestError, *_UNREADABLE)):
+        return True
+    return isinstance(e, CodebergAPIError) and e.status in _GATEWAY_STATUSES
+
+
+async def _send_then_verify(send, verify, also_unknown=lambda e: False) -> dict:
+    """Run a write; if its outcome is unknown, report the state it left behind.
+
+    A lost response or gateway error AFTER the request went out means
+    "unknown", not "failed" — Codeberg's POST /pulls can apply server-side
+    and then break the response. Reporting that as a failure invites a
+    retry that double-applies. `verify()` re-reads the real state and
+    returns the success result, or None if it is not there.
+
+    Any other CodebergAPIError is a definite answer and is never re-checked,
+    unless `also_unknown(e)` says otherwise. A re-check that fails or finds
+    nothing raises OutcomeUnknownError — never an error that reads as a
+    definite failure, since the write may still have landed.
+    """
+    try:
+        return await send()
+    except (CodebergAPIError, httpx.RequestError, *_UNREADABLE) as e:
+        if not (_is_outcome_unknown(e) or also_unknown(e)):
+            raise
+        try:
+            recovered = await verify()
+        except (CodebergAPIError, httpx.RequestError, *_UNREADABLE) as ve:
+            raise OutcomeUnknownError(
+                f"{_transport_error_message(e)} Re-checking also failed "
+                f"({type(ve).__name__}: {_error_text(ve)})."
+            ) from e
+        if recovered is None:
+            raise OutcomeUnknownError(
+                f"{_transport_error_message(e)} A re-check did not find the "
+                "result, but Codeberg reads can lag behind writes."
+            ) from e
+        recovered["recovered_after_read_error"] = True
+        recovered["read_error"] = _transport_error_message(e)
+        return recovered
 
 
 async def _paginate(
@@ -815,6 +908,18 @@ async def get_pull(
     }
 
 
+def _project_pull(pr: dict) -> dict:
+    """The compact PR shape create_pull returns."""
+    return {
+        "number": pr["number"],
+        "title": pr["title"],
+        "state": pr["state"],
+        "html_url": pr["html_url"],
+        "head_branch": pr["head"]["label"],
+        "base_branch": pr["base"]["label"],
+    }
+
+
 @mcp.tool()
 @catch_api_errors
 async def create_pull(
@@ -839,25 +944,54 @@ async def create_pull(
         account: Codeberg account to use (default: the configured default account).
 
     Returns:
-        Created PR object with number, title, html_url.
+        Created PR object with number, title, html_url. If the response was
+        lost but an open PR for head→base exists, that PR is returned with
+        `recovered_after_read_error: true` — do not retry.
     """
     client, auth = _get_client(account)
-    r = await client.post(
-        f"/repos/{owner}/{repo}/pulls",
-        headers=auth,
-        json={"title": title, "head": head, "base": base, "body": body},
-    )
-    _raise(r)
-    pr = r.json()
 
-    return {
-        "number": pr["number"],
-        "title": pr["title"],
-        "state": pr["state"],
-        "html_url": pr["html_url"],
-        "head_branch": pr["head"]["label"],
-        "base_branch": pr["base"]["label"],
-    }
+    async def send() -> dict:
+        r = await client.post(
+            f"/repos/{owner}/{repo}/pulls",
+            headers=auth,
+            json={"title": title, "head": head, "base": base, "body": body},
+        )
+        _raise(r)
+        return _project_pull(r.json())
+
+    async def verify() -> dict | None:
+        # Forgejo allows one open PR per head→base, so a match is either
+        # the one this call created or one that already blocked it —
+        # either way, retrying is wrong. Listing (not GET /pulls/{base}/{head})
+        # because that route cannot carry a `/` in `base`, and every page,
+        # because a repo can hold more than one page of open PRs.
+        async def fetch_page(p: int) -> list[dict]:
+            r = await client.get(
+                f"/repos/{owner}/{repo}/pulls",
+                headers=auth,
+                params={"state": "open", "limit": 50, "page": p},
+                timeout=_RECHECK_TIMEOUT,
+            )
+            _raise(r)
+            return r.json()
+
+        for pr in await _paginate(fetch_page, 50, 1, all=True):
+            if pr["state"] == "open" and pr["base"]["ref"] == base and same_head(pr):
+                return _project_pull(pr)
+        return None
+
+    def same_head(pr: dict) -> bool:
+        # `owner:branch` names a fork head by label; a bare branch must
+        # live in this repo, or a fork's same-named branch would match.
+        if ":" in head:
+            return pr["head"]["label"] == head
+        head_repo = pr["head"].get("repo") or {}
+        return (
+            pr["head"]["ref"] == head
+            and (head_repo.get("full_name") or "").lower() == f"{owner}/{repo}".lower()
+        )
+
+    return await _send_then_verify(send, verify)
 
 
 @mcp.tool()
@@ -867,20 +1001,30 @@ async def merge_pull(
     repo: str,
     index: int,
     method: str = "merge",
+    merge_title: str | None = None,
+    merge_message: str | None = None,
     account: str | None = None,
 ) -> dict:
     """
     Merge a pull request. Branch deletion is never automatic — handle manually.
 
     Args:
-        owner:   Repository owner.
-        repo:    Repository name.
-        index:   PR number.
-        method:  Merge method: 'merge', 'rebase', or 'squash' (default 'merge').
-        account: Codeberg account to use (default: the configured default account).
+        owner:         Repository owner.
+        repo:          Repository name.
+        index:         PR number.
+        method:        Merge method: 'merge', 'rebase', or 'squash' (default 'merge').
+        merge_title:   Commit title for merge/squash (default: Forgejo's).
+        merge_message: Commit body for merge/squash (default: Forgejo's).
+                       Ignored for rebase.
+        account:       Codeberg account to use (default: the configured default account).
 
     Returns:
-        Dict with merged status and method used.
+        Dict with merged status and method used. If the response was lost
+        but the PR is merged, `recovered_after_read_error: true` is added.
+        A 405 with an empty message is how Codeberg answers a merge of an
+        already-merged PR, so it is re-checked rather than reported — if the
+        PR is not merged after the re-checks, the result is "unknown"
+        (status null), not a definite 405. Descriptive 405s are reported.
     """
     if method not in ("merge", "rebase", "squash"):
         raise ToolUsageError(
@@ -888,14 +1032,50 @@ async def merge_pull(
         )
 
     client, auth = _get_client(account)
-    r = await client.post(
-        f"/repos/{owner}/{repo}/pulls/{index}/merge",
-        headers=auth,
-        json={"do": method, "delete_branch_after_merge": False},
-    )
-    _raise(r)
+    result = {"merged": True, "method": method}
+    body: dict = {"do": method, "delete_branch_after_merge": False}
+    if merge_title is not None:
+        body["MergeTitleField"] = merge_title
+    if merge_message is not None:
+        body["MergeMessageField"] = merge_message
 
-    return {"merged": True, "method": method}
+    async def send() -> dict:
+        r = await client.post(
+            f"/repos/{owner}/{repo}/pulls/{index}/merge",
+            headers=auth,
+            json=body,
+        )
+        if r.status_code == 405 and not _json_message(r):
+            # `_detail` would fall back to the whole body; keep it empty so
+            # `already_merged` can tell this apart from a descriptive 405.
+            raise CodebergAPIError(405, "")
+        _raise(r)
+        return result
+
+    async def verify() -> dict | None:
+        # `merged` can read false for a while after a merge that landed
+        # (observed up to ~75s), so one immediate read is not enough.
+        for delay in _MERGE_RECHECK_DELAYS:
+            await asyncio.sleep(delay)
+            r = await client.get(
+                f"/repos/{owner}/{repo}/pulls/{index}",
+                headers=auth,
+                timeout=_RECHECK_TIMEOUT,
+            )
+            _raise(r)
+            if r.json().get("merged"):
+                return result
+        return None
+
+    def already_merged(e: Exception) -> bool:
+        return isinstance(e, CodebergAPIError) and e.status == 405 and not e.detail
+
+    return await _send_then_verify(send, verify, also_unknown=already_merged)
+
+
+# Seconds to wait before each merge re-check — with the per-read timeout,
+# worst case ~22s, inside a single tool call.
+_MERGE_RECHECK_DELAYS = (0.0, 2.0, 5.0)
 
 
 # ── branch tools ────────────────────────────────────────────────────────────

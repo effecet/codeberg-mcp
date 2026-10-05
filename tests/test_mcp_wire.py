@@ -115,12 +115,13 @@ async def _noop() -> None:
     return None
 
 
-async def test_decoding_error_is_not_reported_as_unreachable(mcp_client, respx_mock):
-    # Only transport failures mean "no HTTP answer, outcome unknown". A body
-    # httpx cannot decode is an answer, so it must not become status: null.
+async def test_decoding_error_is_an_unknown_outcome(mcp_client, respx_mock):
+    # A body httpx cannot decode gives no usable answer either: for a write,
+    # the server may have applied it, so it reports status null.
     respx_mock.get("/repos/e/x").mock(side_effect=httpx.DecodingError("bad gzip"))
-    with pytest.raises(httpx.DecodingError):
-        await server.get_repo(owner="e", repo="x")
+    result = await server.get_repo(owner="e", repo="x")
+    assert result["status"] is None
+    assert "DecodingError" in result["error"]
 
 
 async def test_write_tool_transport_error_has_null_status(
@@ -134,3 +135,17 @@ async def test_write_tool_transport_error_has_null_status(
     )
     assert error["status"] is None
     assert "ReadTimeout" in error["error"]
+
+
+async def test_list_tool_gateway_error_is_unknown_on_the_wire(
+    fake_accounts, respx_mock
+):
+    respx_mock.get("/repos/e/r/branches").mock(
+        return_value=httpx.Response(504, json={"message": "gateway timeout"})
+    )
+    result = await _call(respx_mock, "list_branches", {"owner": "e", "repo": "r"})
+    assert result.is_error
+    text = _text(result)
+    error = json.loads(text[text.index("{") :])
+    assert error["status"] is None
+    assert "504" in error["error"]
