@@ -30,7 +30,9 @@ import functools
 import inspect
 import json
 import os
+import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -38,7 +40,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
 import httpx  # noqa: E402
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 # ── server ──────────────────────────────────────────────────────────────────
@@ -85,19 +87,26 @@ async def _lifespan(server):
             "CODEBERG_ACCOUNTS is not set. "
             'Expected JSON: {"personal": "tok_...", "work": "tok_..."}'
         )
-    _accounts = json.loads(raw)
-    if not _accounts:
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            'CODEBERG_ACCOUNTS must be a JSON object: {"name": "token", ...}'
+        )
+    if not parsed:
         raise RuntimeError("CODEBERG_ACCOUNTS is empty.")
     # A stray newline or space in a token makes httpx raise an error whose
     # message repeats the whole Authorization header. Strip, then refuse
     # anything that is not printable ASCII so that error can never happen.
-    _accounts = {name: str(tok).strip() for name, tok in _accounts.items()}
-    for name, tok in _accounts.items():
+    accounts = {}
+    for name, tok in parsed.items():
+        tok = tok.strip() if isinstance(tok, str) else ""
         if not tok or any(not 0x21 <= ord(c) <= 0x7E for c in tok):
             raise RuntimeError(
-                f"CODEBERG_ACCOUNTS: token for '{name}' is empty or has "
-                "whitespace/control characters."
+                f"CODEBERG_ACCOUNTS: token for '{name}' is not a non-empty "
+                "string of printable ASCII."
             )
+        accounts[name] = tok
+    _accounts = accounts
 
     # Default to CODEBERG_DEFAULT_ACCOUNT, else the first configured account.
     _default_account = os.environ.get("CODEBERG_DEFAULT_ACCOUNT") or next(
@@ -199,6 +208,8 @@ _GATEWAY_STATUSES = frozenset({502, 503, 504})
 
 # A body that cannot be read as JSON: invalid JSON, or bytes that are not
 # UTF-8 (an HTML error page from a proxy, say). Neither is a definite answer.
+# Caught across every tool, so tool code must decode leniently (errors="replace"):
+# a strict .decode() bug would otherwise be reported as "no definite answer".
 _UNREADABLE = (json.JSONDecodeError, UnicodeDecodeError)
 
 # Per-read timeout for the re-checks after a write whose outcome is unknown.
@@ -255,6 +266,10 @@ def _safe_list(value: object) -> list:
     return value if isinstance(value, list) else []
 
 
+# What catch_api_errors turns into a structured {error, status} result.
+_API_ERRORS = (CodebergAPIError, OutcomeUnknownError, httpx.RequestError, *_UNREADABLE)
+
+
 def catch_api_errors(fn):
     """Convert API, transport and unknown-outcome errors into tool results.
 
@@ -283,16 +298,21 @@ def catch_api_errors(fn):
     async def wrapper(*args, **kwargs):
         try:
             return await fn(*args, **kwargs)
-        except CodebergAPIError as e:
-            if e.status in _GATEWAY_STATUSES:
-                return _result({"error": _transport_error_message(e), "status": None})
-            return _result({"error": str(e), "status": e.status})
-        except OutcomeUnknownError as e:
-            return _result({"error": str(e), "status": None})
-        except (httpx.RequestError, *_UNREADABLE) as e:
-            return _result({"error": _transport_error_message(e), "status": None})
+        except _API_ERRORS as e:
+            return _result(_api_error_dict(e))
 
     return wrapper
+
+
+def _api_error_dict(e: Exception) -> dict:
+    """The structured error a tool reports for one of _API_ERRORS."""
+    if isinstance(e, CodebergAPIError) and e.status not in _GATEWAY_STATUSES:
+        return {"error": str(e), "status": e.status}
+    if isinstance(e, OutcomeUnknownError):
+        return {"error": str(e), "status": None}
+    # No HTTP status to report, and httpx transport errors usually
+    # stringify to '', which would reach the client as an empty error.
+    return {"error": _transport_error_message(e), "status": None}
 
 
 def _error_text(e: Exception) -> str:
@@ -1014,8 +1034,9 @@ async def merge_pull(
         index:         PR number.
         method:        Merge method: 'merge', 'rebase', or 'squash' (default 'merge').
         merge_title:   Commit title for merge/squash (default: Forgejo's).
-        merge_message: Commit body for merge/squash (default: Forgejo's).
-                       Ignored for rebase.
+        merge_message: Commit body for merge/squash (default: Forgejo's) —
+                       how a long PR rationale reaches the base branch's
+                       history. Ignored for rebase.
         account:       Codeberg account to use (default: the configured default account).
 
     Returns:
@@ -1293,15 +1314,32 @@ async def list_workflow_runs(
         account: Codeberg account to use (default: the configured default account).
 
     Returns:
-        List of run objects: {id, name, status, conclusion, head_branch,
-        head_sha, run_number, event, created, updated, url}.
+        List of run objects: {id, name, title, status, conclusion,
+        head_branch, head_sha, run_number, event, trigger_user, created,
+        started, stopped, duration_s, updated, need_approval, approved_by,
+        url}. `duration_s`, `started` and `stopped` are null until they
+        happen; a run cancelled while queued has no `started`. `duration_s`
+        separates a run that died before its tests from one that ran them;
+        `started` minus `created` is queue wait. `need_approval` explains a
+        run stuck queued; `approved_by` is a user id, 0 for none.
+        `head_branch` falls back to Forgejo's display ref, which is `#N` for
+        a pull_request run and the tag name for a tag push.
     """
     client, auth = _get_client(account)
+    # Keep sending `page`: without it the API ignores `limit` and returns
+    # every run (102 for one repo on 2026-10-01, not 5).
     params: dict = {"limit": min(limit, 50), "page": page}
     if branch:
         params["branch"] = branch
     if status:
         params["status"] = status
+    return await _fetch_runs(client, auth, owner, repo, params)
+
+
+async def _fetch_runs(
+    client, auth: dict, owner: str, repo: str, params: dict
+) -> list[dict]:
+    """list_workflow_runs without the tool wrapper: API errors raise."""
     # Use /actions/runs (not /actions/tasks) — the tasks endpoint hides
     # runs that are still in `waiting` status (Forgejo runs-vs-tasks split).
     r = await client.get(
@@ -1310,21 +1348,145 @@ async def list_workflow_runs(
     _raise(r)
     data = r.json()
     runs = data.get("workflow_runs", data) if isinstance(data, dict) else data
+    return [_project_run(run) for run in _safe_list(runs)]
+
+
+def _project_run(run: dict) -> dict:
+    """One /actions/runs row, as list_workflow_runs and get_workflow_run return it."""
+    return {
+        "id": run["id"],
+        "name": run.get("name") or run.get("workflow_id", ""),
+        "title": run.get("title", ""),
+        "status": run.get("status", ""),
+        "conclusion": run.get("conclusion", ""),
+        # /actions/runs carries prettyref / index_in_repo; the head_branch
+        # and run_number keys belong to /actions/tasks and are absent here.
+        "head_branch": run.get("head_branch") or run.get("prettyref", ""),
+        "head_sha": run.get("head_sha") or run.get("commit_sha", ""),
+        "run_number": run.get("run_number") or run.get("index_in_repo", 0),
+        "event": run.get("event", ""),
+        "trigger_user": (run.get("trigger_user") or {}).get("login", ""),
+        "created": run.get("created") or run.get("created_at", ""),
+        "started": _run_time(run.get("started")),
+        "stopped": _run_time(run.get("stopped")),
+        "duration_s": _run_duration_s(run),
+        "updated": run.get("updated") or run.get("updated_at", ""),
+        "need_approval": run.get("need_approval", False),
+        "approved_by": run.get("approved_by", 0),
+        "url": run.get("html_url", ""),
+    }
+
+
+def _run_time(value: str | None) -> str | None:
+    """A run timestamp, or None for "not yet": Forgejo sends the Unix epoch."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:  # read as UTC, not as this machine's local time
+        parsed = parsed.replace(tzinfo=UTC)
+    return value if parsed.timestamp() > 0 else None
+
+
+def _run_duration_s(run: dict) -> int | None:
+    """Forgejo's `duration` is a Go time.Duration (nanoseconds).
+
+    None until the run has stopped: a running run may already report elapsed
+    time, which would read as a finished one.
+    """
+    ns = run.get("duration")
+    return round(ns / 1e9) if ns and _run_time(run.get("stopped")) else None
+
+
+@mcp.tool()
+@catch_api_errors
+async def list_runners(
+    owner: str | None = None,
+    repo: str | None = None,
+    account: str | None = None,
+) -> list[dict]:
+    """
+    List Actions runners: user-level by default, repo-level with owner+repo.
+
+    Answers "does a self-hosted runner exist, is it online, and which labels
+    can a workflow target?" in one call.
+
+    Args:
+        owner:   Repository owner (repo scope only; give with repo).
+        repo:    Repository name (repo scope only; give with owner).
+        account: Codeberg account to use (default: the configured default account).
+
+    Returns:
+        List of {id, name, status, labels, version, ephemeral}; at most the
+        first 50 runners in the scope.
+    """
+    if (owner is None) != (repo is None):
+        raise ToolUsageError("Pass both owner and repo for repo scope, or neither.")
+    path = (
+        f"/repos/{owner}/{repo}/actions/runners"
+        if repo is not None
+        else "/user/actions/runners"
+    )
+    client, auth = _get_client(account)
+    # `page` makes the API honour `limit`; see list_workflow_runs.
+    r = await client.get(path, headers=auth, params={"limit": 50, "page": 1})
+    _raise(r)
     return [
         {
-            "id": run["id"],
-            "name": run.get("name") or run.get("workflow_id", ""),
-            "status": run.get("status", ""),
-            "conclusion": run.get("conclusion", ""),
-            "head_branch": run.get("head_branch", ""),
-            "head_sha": run.get("head_sha") or run.get("commit_sha", ""),
-            "run_number": run.get("run_number", 0),
-            "event": run.get("event", ""),
-            "created": run.get("created") or run.get("created_at", ""),
-            "updated": run.get("updated") or run.get("updated_at", ""),
-            "url": run.get("html_url", ""),
+            "id": runner["id"],
+            "name": runner.get("name", ""),
+            "status": runner.get("status", ""),
+            "labels": _safe_list(runner.get("labels")),
+            "version": runner.get("version", ""),
+            "ephemeral": runner.get("ephemeral", False),
         }
-        for run in runs
+        for runner in _safe_list(r.json())
+    ]
+
+
+@mcp.tool()
+@catch_api_errors
+async def list_queued_jobs(
+    owner: str,
+    repo: str,
+    labels: str | None = None,
+    account: str | None = None,
+) -> list[dict]:
+    """
+    List a repo's Actions jobs waiting for a runner.
+
+    The only view of `attempt` (first try vs re-run) and `runs_on` (the
+    labels a queued job is actually waiting on).
+
+    Args:
+        owner:   Repository owner.
+        repo:    Repository name.
+        labels:  Optional comma-separated runner labels to filter by.
+        account: Codeberg account to use (default: the configured default account).
+
+    Returns:
+        List of {id, name, run_id, attempt, status, runs_on}; empty when
+        nothing is queued.
+    """
+    client, auth = _get_client(account)
+    params = {"labels": labels} if labels else {}
+    r = await client.get(
+        f"/repos/{owner}/{repo}/actions/runners/jobs", headers=auth, params=params
+    )
+    _raise(r)
+    # An empty queue comes back as a literal `null`, hence _safe_list.
+    return [
+        {
+            "id": job["id"],
+            "name": job.get("name", ""),
+            "run_id": job.get("run_id", 0),
+            "attempt": job.get("attempt", 0),
+            "status": job.get("status", ""),
+            "runs_on": _safe_list(job.get("runs_on")),
+        }
+        for job in _safe_list(r.json())
     ]
 
 
@@ -1344,8 +1506,8 @@ async def get_workflow_run(
     returns full run metadata including status, commit_sha, event_payload,
     trigger_user, html_url). Previous implementation walked the list
     endpoint because older docs claimed no detail endpoint existed —
-    that claim was wrong. Per-job breakdown is still NOT available via
-    API — use the `url` field to open the run in the browser.
+    that claim was wrong. Per-job breakdown is not returned here — use
+    get_workflow_logs, which lists the jobs and fetches their logs.
 
     Args:
         owner:   Repository owner.
@@ -1354,7 +1516,10 @@ async def get_workflow_run(
         account: Codeberg account to use (default: the configured default account).
 
     Returns:
-        Run object with metadata + UI url. No per-job detail.
+        The fields list_workflow_runs returns, plus workflow_id,
+        display_title, created_at, updated_at, an empty `jobs` list and a
+        `_note` pointing at get_workflow_logs. `url` falls back to the API
+        url when the run has no web url.
     """
     client, auth = _get_client(account)
     r = await client.get(f"/repos/{owner}/{repo}/actions/runs/{run_id}", headers=auth)
@@ -1366,14 +1531,9 @@ async def get_workflow_run(
     _raise(r)
     run = r.json()
     return {
-        "id": run["id"],
-        "name": run.get("name") or run.get("workflow_id", ""),
-        "status": run.get("status", ""),
-        "conclusion": run.get("conclusion", ""),
-        "head_branch": run.get("head_branch", ""),
-        "head_sha": run.get("head_sha") or run.get("commit_sha", ""),
-        "run_number": run.get("run_number", 0),
-        "event": run.get("event", ""),
+        **_project_run(run),
+        # Keys predating _project_run, kept so existing callers don't break.
+        # `url` overrides the projection's: it also falls back to the API url.
         "workflow_id": run.get("workflow_id", ""),
         "display_title": run.get("title") or run.get("display_title", ""),
         "created_at": run.get("created") or run.get("created_at", ""),
@@ -1381,11 +1541,326 @@ async def get_workflow_run(
         "url": run.get("html_url") or run.get("url", ""),
         "jobs": [],
         "_note": (
-            "Per-job detail is not exposed by the Codeberg "
-            "Forgejo API. Open the `url` in a browser to view "
-            "jobs and logs."
+            "Per-job detail is not included here. Call "
+            "get_workflow_logs for each job's status and log."
         ),
     }
+
+
+_TERMINAL_STATUSES = frozenset({"success", "failure", "cancelled", "skipped"})
+_WAIT_MAX_TIMEOUT_S = 1800
+_WAIT_MIN_POLL_S = 5
+_WAIT_RUN_WINDOW = 50  # how many recent runs wait_for_runs searches
+# Indirection so tests can drive the wait loop without real time passing;
+# patching time.monotonic itself would also move the event loop's clock.
+_wait_now = time.monotonic
+_wait_sleep = asyncio.sleep
+
+
+def _parse_jobs(body: object) -> list[dict]:
+    """The job rows of a /actions/runs/{id}/jobs body."""
+    if isinstance(body, dict):  # upstream Gitea wraps the list
+        body = body.get("jobs")
+    return [
+        j
+        for j in _safe_list(body)
+        if isinstance(j, dict) and type(j.get("id")) is int  # bool is an int subclass
+    ]
+
+
+def _transient(status: int | None) -> bool:
+    """No definite answer (status None) or a server-side failure: retry it."""
+    return status is None or status >= 500
+
+
+async def _run_jobs(
+    client, auth: dict, owner: str, repo: str, run_id: int
+) -> list[dict] | None:
+    """A run's jobs as {id, name, status}, or None when they can't be read now.
+
+    None covers a 404 and a transient failure; a definite 4xx still raises.
+    """
+    try:
+        r = await client.get(
+            f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", headers=auth
+        )
+        if r.status_code == 404:
+            return None
+        _raise(r)
+        body = r.json()
+    except CodebergAPIError as e:
+        if _transient(e.status):
+            return None
+        raise
+    except (httpx.RequestError, *_UNREADABLE):
+        return None
+    return [
+        {"id": j["id"], "name": j.get("name", ""), "status": j.get("status", "")}
+        for j in _parse_jobs(body)
+    ]
+
+
+def _jobs_status(jobs: list[dict] | None) -> str | None:
+    """The status a run's jobs add up to, or None while any is still going."""
+    if not jobs or any(j["status"] not in _TERMINAL_STATUSES for j in jobs):
+        return None
+    for status in ("failure", "cancelled"):
+        if any(j["status"] == status for j in jobs):
+            return status
+    return "success" if any(j["status"] == "success" for j in jobs) else "skipped"
+
+
+async def _runs_for_sha(
+    client,
+    auth: dict,
+    owner: str,
+    repo: str,
+    sha: str,
+    event: str | None,
+    branch: str | None,
+) -> list[dict] | dict:
+    """The recent runs for a commit, each with `jobs` and `effective_status`.
+
+    A run that is not yet terminal gets its jobs fetched, and takes their
+    verdict once they have all finished. Returns the structured error dict
+    list_workflow_runs would report when the run list can't be read.
+    """
+    try:
+        listed = await _fetch_runs(
+            client, auth, owner, repo, {"limit": _WAIT_RUN_WINDOW, "page": 1}
+        )
+    except _API_ERRORS as e:
+        return _api_error_dict(e)
+    runs = []
+    for run in listed:
+        # One-way prefix match, so a run with no sha can never match.
+        if not (run["head_sha"] or "").lower().startswith(sha):
+            continue
+        if event and run["event"] != event:
+            continue
+        if branch and run["head_branch"] != branch:
+            continue
+        run["jobs"] = None
+        run["effective_status"] = run["status"]
+        if run["status"] not in _TERMINAL_STATUSES:
+            # A definite 4xx here propagates on purpose: runs and their jobs
+            # share one Actions permission, so it is a real error, and
+            # trusting the possibly stale row would only hide it until timeout.
+            run["jobs"] = await _run_jobs(client, auth, owner, repo, run["id"])
+            run["effective_status"] = _jobs_status(run["jobs"]) or run["status"]
+        runs.append(run)
+    return runs
+
+
+async def _report_wait_progress(
+    ctx: Context | None,
+    waited: float,
+    timeout_s: int,
+    runs: list[dict],
+    pending: list[dict],
+    listed_ok: bool,
+) -> None:
+    """Tell the client the wait is alive. Best-effort: never fails the wait."""
+    if ctx is None:
+        return
+    if not listed_ok:
+        message = "run list unavailable, retrying"
+    elif runs:
+        message = f"{len(runs) - len(pending)}/{len(runs)} runs finished"
+    else:
+        message = "no matching run yet"
+    try:
+        await ctx.report_progress(round(waited), timeout_s, message)
+    except Exception as e:  # a lost notification must not end the wait
+        logger.debug("wait_for_runs progress not sent: %s", e)
+
+
+@mcp.tool()
+@catch_api_errors
+async def wait_for_runs(
+    owner: str,
+    repo: str,
+    head_sha: str,
+    event: str | None = None,
+    branch: str | None = None,
+    timeout_s: int = 600,
+    poll_s: int = 30,
+    settle_s: int = 120,
+    account: str | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """
+    Wait until every Actions run for a commit has finished, then report them.
+
+    Use this instead of sleep timers or hand-rolled polling against the raw
+    API: it reads the same projection as list_workflow_runs, so field names
+    are handled in one place. Runs are matched on the commit sha, so PR runs
+    (head_branch `#N`) and push runs for the same commit are both included
+    unless `event` / `branch` narrow them. The run list can lag behind its
+    jobs, so a run that still reads waiting/running is cross-checked
+    against its jobs, and counts as done once every job has finished.
+
+    ⚠️ After a rebase or fast-forward merge the commit on the target branch
+    has the PR head's sha, whose PR and branch-push runs finished long ago.
+    Without filters they alone answer "done" before the new push run is
+    queued. Pass event="push" and branch="<target>" to wait for that run.
+
+    Each poll that keeps waiting reports MCP progress, when the client asked
+    for it with a progressToken: progress is seconds waited, total is
+    timeout_s, and the message is "N/M runs finished", "no matching run yet"
+    or "run list unavailable, retrying". Nothing is sent on completion. A
+    client that resets its request timeout on progress then won't abort a
+    long wait. A machine that sleeps mid-wait still freezes it; on a laptop,
+    keep it awake.
+
+    Args:
+        owner:     Repository owner.
+        repo:      Repository name.
+        head_sha:  Commit sha, full or a prefix of at least 7 characters.
+        event:     Only runs with this trigger, e.g. "push" or
+                   "pull_request".
+        branch:    Only runs whose head_branch is this ("main", or "#N" for
+                   a PR run). Matched on the projection, not by the API.
+                   Both are exact strings: a value no run has (a typo
+                   included) matches nothing and ends in "no_runs".
+        timeout_s: Give up after this many seconds (default 600, max 1800).
+                   On timeout, call again to keep waiting. The last check
+                   can overrun it by one round of requests.
+        poll_s:    Seconds between checks (default 30, min 5).
+        settle_s:  If no matching run has appeared after this many seconds,
+                   stop with outcome "no_runs" (default 120, never longer
+                   than timeout_s).
+        account:   Codeberg account to use (default: the configured default account).
+
+    Returns:
+        {outcome, all_success, waited_s, searched, transient_errors, runs}.
+        outcome is one of:
+          - "done": every matching run finished.
+          - "timeout": some are still waiting or running.
+          - "needs_approval": a run is held for approval (need_approval)
+            and will not start until someone approves it.
+          - "no_runs": a poll read the run list and nothing matched
+            within settle_s (an unreadable list is "timeout"). Either no
+            run was created (a merge whose response was lost can land
+            without a push run) or it is older than the `searched` most
+            recent runs.
+        all_success is true only for "done" when every run succeeded or was
+        skipped; a run whose jobs were all skipped counts, so check `jobs`
+        if a workflow should have done work. transient_errors counts polls
+        lost to 5xx or no-answer failures; they are retried until the
+        deadline. Each run is the list_workflow_runs projection plus
+        `effective_status` (the jobs' verdict when the run row lagged,
+        otherwise the run status) and `jobs`: a list of {id, name, status}
+        (the id is what get_workflow_logs takes as job_id), or null when
+        they were not fetched (a run already finished, on any outcome but
+        "done") or could not be read.
+
+        A run list that fails with a definite error (a 4xx) ends the wait
+        with the usual {error, status} dict instead, which has no `outcome`.
+    """
+    sha = head_sha.strip().lower()
+    if len(sha) < 7:
+        raise ToolUsageError("head_sha must be at least 7 characters.")
+    timeout_s = max(0, min(timeout_s, _WAIT_MAX_TIMEOUT_S))
+    settle_s = max(0, min(settle_s, timeout_s))
+    poll_s = max(_WAIT_MIN_POLL_S, poll_s)
+    client, auth = _get_client(account)
+    start = _wait_now()
+    runs: list[dict] = []
+    transient_errors = 0
+
+    def result(outcome: str) -> dict:
+        all_success = outcome == "done" and all(
+            r["effective_status"] in ("success", "skipped") for r in runs
+        )
+        return {
+            "outcome": outcome,
+            "all_success": all_success,
+            "waited_s": round(_wait_now() - start),
+            "searched": _WAIT_RUN_WINDOW,
+            "transient_errors": transient_errors,
+            "runs": runs,
+        }
+
+    while True:
+        fetched = await _runs_for_sha(client, auth, owner, repo, sha, event, branch)
+        if isinstance(fetched, dict):  # list_workflow_runs' structured error
+            if not _transient(fetched["status"]):
+                return fetched
+            transient_errors += 1  # keep the last good runs, try again
+        else:
+            runs = fetched
+        listed_ok = not isinstance(fetched, dict)
+        waited = _wait_now() - start
+        pending = [r for r in runs if r["effective_status"] not in _TERMINAL_STATUSES]
+        if runs and not pending:
+            for run in runs:
+                if run["jobs"] is None:  # so a failing job's id is to hand
+                    try:
+                        run["jobs"] = await _run_jobs(
+                            client, auth, owner, repo, run["id"]
+                        )
+                    except CodebergAPIError:
+                        pass  # the verdict is known; jobs stay null
+            return result("done")
+        if any(r["need_approval"] and not r["approved_by"] for r in pending):
+            return result("needs_approval")
+        # "no_runs" only on a poll that read the list: an outage is a timeout.
+        if not runs and listed_ok and waited >= settle_s:
+            return result("no_runs")
+        if waited >= timeout_s:
+            return result("timeout")
+        await _report_wait_progress(ctx, waited, timeout_s, runs, pending, listed_ok)
+        await _wait_sleep(min(poll_s, max(1, timeout_s - waited)))
+
+
+def _tail_bytes(text: str, max_bytes: int) -> str:
+    """Keep the last max_bytes of text, marking how much was cut from the start."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    omitted = len(encoded) - max_bytes
+    tail = encoded[-max_bytes:].decode("utf-8", errors="ignore")
+    return f"[truncated — {omitted} bytes omitted from the start]\n{tail}"
+
+
+def _split_budget(sizes: list[int], total: int) -> list[int]:
+    """Share total bytes across logs: short logs keep everything, and what
+    they leave unused goes to the long ones (where the failing step usually is)."""
+    budgets = [0] * len(sizes)
+    pending = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    remaining = total
+    while pending:
+        share = max(1, remaining // len(pending))
+        i = pending.pop(0)
+        budgets[i] = min(sizes[i], share)
+        remaining = max(0, remaining - budgets[i])
+    return budgets
+
+
+async def _workflow_logs_unavailable(
+    owner: str, repo: str, run_id: int, account: str | None, job_id: int | None
+) -> str:
+    """Degrade to the run's UI URL when the jobs listing or a job_id 404s."""
+    url = f"https://codeberg.org/{owner}/{repo}/actions (filter by run_id={run_id})"
+    try:
+        meta = await get_workflow_run(
+            owner=owner, repo=repo, run_id=run_id, account=account
+        )
+        # API failures come back as an error dict without `url` (the
+        # decorator catches them), so the filtered page stays the fallback.
+        url = meta.get("url") or url
+    except ToolUsageError:
+        pass  # get_workflow_run raises this for an unknown run_id
+    if job_id is not None:
+        what, hint = f"job_id={job_id}", "Omit job_id to list the run's jobs"
+    else:
+        what = f"run_id={run_id}"
+        hint = "Pass the `id` field from list_workflow_runs, not run_number"
+    return (
+        f"No logs found for {what} on {owner}/{repo} (404). {hint}, "
+        f"or open the run in a browser: {url}"
+    )
 
 
 @mcp.tool()
@@ -1399,61 +1874,83 @@ async def get_workflow_logs(
     account: str | None = None,
 ) -> str:
     """
-    Attempt to fetch raw logs for a workflow run.
+    Fetch raw logs for a workflow run, one section per job.
 
-    **Known limitation (2026-04-17):** Codeberg's Forgejo instance does NOT
-    expose Actions run logs via REST API. None of `/actions/tasks/{id}/logs`,
-    `/actions/runs/{id}/logs`, `/actions/jobs/{id}/logs` etc. are registered
-    (all return 404 "resource does not exist"). The Web UI renders logs via
-    an authenticated websocket/XHR that isn't part of the public API surface.
+    Forgejo (v12.10, verified 2026-10-22) serves job logs as
+    text/plain at `/actions/jobs/{job_id}/logs`; the job ids come from
+    `/actions/runs/{run_id}/jobs`, which returns a bare list. The
+    `/actions/tasks/...` paths this tool tried before 2026-10-22 were never
+    registered, which is why it used to report logs as unavailable.
 
-    This function still tries the documented endpoint (in case Forgejo ships
-    it later) and, on 404, returns a clear degradation message with the UI
-    URL of the run so the user can open it manually.
+    Truncation keeps the END of each log, where the failing step is. With
+    several jobs, short logs are kept whole and the rest of the budget goes
+    to the longer ones. A job whose log 404s (queued, skipped) gets a
+    one-line note instead of failing the whole call; any other error status
+    fails the call with the usual structured error.
 
     Args:
         owner:     Repository owner.
         repo:      Repository name.
-        run_id:    Workflow run/task ID (from list_workflow_runs).
-        job_id:    Optional specific job ID for per-job logs.
-        max_bytes: Truncation cap in bytes (default 50000).
+        run_id:    The `id` field from list_workflow_runs — NOT run_number,
+                   and not the number in the run's web URL.
+        job_id:    Optional job ID; fetches only that job's log, with no
+                   header. run_id is then used only for the 404 message.
+        max_bytes: Cap on log bytes across all jobs (default 50000). Job
+                   headers and truncation markers are extra.
         account:   Codeberg account to use (default: the configured default account).
 
     Returns:
-        Raw log text if the API exposes it, OR a degradation message with
-        the UI URL on 404.
+        Log text with a `=== job <name> (id <id>, <status>) ===` header per
+        job, OR a degradation message with the run's UI URL on 404.
     """
     client, auth = _get_client(account)
-    path = f"/repos/{owner}/{repo}/actions/tasks/{run_id}/logs"
-    if job_id is not None:
-        path = f"/repos/{owner}/{repo}/actions/tasks/{run_id}/jobs/{job_id}/logs"
-    r = await client.get(path, headers=auth)
-    if r.status_code == 404:
-        # Degrade: find the run's UI URL via list + filter so we can at
-        # least hand the user a clickable link.
-        try:
-            meta = await get_workflow_run(
-                owner=owner, repo=repo, run_id=run_id, account=account
-            )
-            url = meta.get("url", "")
-        except Exception:
-            url = (
-                f"https://codeberg.org/{owner}/{repo}/actions "
-                f"(filter by run_id={run_id})"
-            )
-        return (
-            "Logs are not exposed by the Codeberg Forgejo API as of "
-            "2026-04-17 — all /actions/*/logs endpoints return 404. "
-            f"Open the run in a browser: {url}"
+
+    async def fetch(jid: int) -> httpx.Response:
+        return await client.get(
+            f"/repos/{owner}/{repo}/actions/jobs/{jid}/logs", headers=auth
         )
+
+    if job_id is not None:
+        r = await fetch(job_id)
+        if r.status_code == 404:
+            return await _workflow_logs_unavailable(
+                owner, repo, run_id, account, job_id
+            )
+        _raise(r)
+        return _tail_bytes(r.text, max(1, max_bytes))
+
+    r = await client.get(
+        f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", headers=auth
+    )
+    if r.status_code == 404:
+        return await _workflow_logs_unavailable(owner, repo, run_id, account, None)
     _raise(r)
-    text = r.text
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    cutoff = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    omitted = len(encoded) - max_bytes
-    return f"{cutoff}\n[truncated — {omitted} bytes omitted]"
+    jobs = _parse_jobs(r.json())
+    if not jobs:
+        return f"Run {run_id} has no jobs yet."
+
+    # Sequential on purpose: runs have a few jobs, and the API is rate-limited.
+    texts: list[str | None] = []  # None = that job's log 404'd
+    for job in jobs:
+        resp = await fetch(job["id"])
+        if resp.status_code == 404:
+            texts.append(None)
+            continue
+        _raise(resp)
+        texts.append(resp.text)
+    sizes = [len(t.encode("utf-8")) if t is not None else 0 for t in texts]
+    budgets = _split_budget(sizes, max_bytes)
+    sections = []
+    for job, text, budget in zip(jobs, texts, budgets, strict=True):
+        name, status = job.get("name", "?"), job.get("status", "?")
+        header = f"=== job {name} (id {job['id']}, {status}) ==="
+        log = (
+            "(no log: 404 — not started, skipped, or expired)"
+            if text is None
+            else _tail_bytes(text, max(1, budget))
+        )
+        sections.append(f"{header}\n{log}")
+    return "\n\n".join(sections)
 
 
 # ── issue tools ──────────────────────────────────────────────────────────────
@@ -1948,7 +2445,8 @@ async def cancel_workflow_run(
     Cancel a running or queued workflow run.
 
     Idempotent on finished runs (Forgejo returns 200 or 412 depending on
-    version — both pass through).
+    version — both pass through). codeberg.org does not register this
+    endpoint and answers 404; it works only where the instance exposes it.
 
     Args:
         owner:   Repository owner.
@@ -1984,7 +2482,9 @@ async def rerun_workflow_run(
 
     Returns 412 if the run is still in progress — callers should
     `cancel_workflow_run` first if needed, then poll until status is
-    'cancelled' or 'completed' before rerunning.
+    'cancelled' or 'completed' before rerunning. codeberg.org does not
+    register this endpoint and answers 404; it works only where the
+    instance exposes it.
 
     Args:
         owner:   Repository owner.

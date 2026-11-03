@@ -372,6 +372,8 @@ async def test_merge_pull_stays_unknown_when_recheck_fails(mcp_client, respx_moc
     result = await server.merge_pull(owner="e", repo="r", index=7)
     assert result["status"] is None
     assert "Re-checking also failed" in result["error"]
+    # Its own message, not re-wrapped as another "no definite answer".
+    assert "OutcomeUnknownError" not in result["error"]
 
 
 def test_merge_recheck_outlasts_a_single_read():
@@ -469,3 +471,29 @@ async def test_non_utf8_body_after_create_pull_is_rechecked(mcp_client, respx_mo
     assert result["number"] == 12
     assert result["recovered_after_read_error"] is True
     assert "UnicodeDecodeError" in result["read_error"]
+
+
+async def test_non_utf8_body_on_any_tool_is_unknown_not_a_crash(mcp_client, respx_mock):
+    respx_mock.get("/repos/e/r").mock(
+        return_value=httpx.Response(
+            200, content="<html>Passerelle dépassée</html>".encode("latin-1")
+        )
+    )
+    result = await server.get_repo(owner="e", repo="r")
+    assert result["status"] is None
+    assert "UnicodeDecodeError" in result["error"]
+
+
+async def test_create_pull_stays_unknown_when_recheck_body_is_non_utf8(
+    mcp_client, respx_mock
+):
+    respx_mock.post(PULLS).mock(side_effect=httpx.ReadTimeout(""))
+    respx_mock.get(PULLS).mock(
+        return_value=httpx.Response(
+            200, content="<html>dépassée</html>".encode("latin-1")
+        )
+    )
+    result = await _create()
+    assert result["status"] is None
+    assert "Re-checking also failed" in result["error"]
+    assert "UnicodeDecodeError" in result["error"]

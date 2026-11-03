@@ -186,7 +186,7 @@ def test_decorator_preserves_signature_and_schema():
     assert list(sig.parameters) == ["owner", "repo", "issue_number", "account"]
 
     tools = asyncio.run(server.mcp.list_tools())
-    assert len(tools) == 48  # +1: edit_issue (demo-repo#13)
+    assert len(tools) == 51  # +3: list_runners, list_queued_jobs, wait_for_runs
     gi = next(t for t in tools if t.name == "get_issue")
     assert set(gi.input_schema["properties"]) == {
         "owner",

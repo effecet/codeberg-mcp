@@ -111,6 +111,23 @@ async def test_lifespan_rejects_or_strips_bad_tokens(monkeypatch, token):
                 pass
 
 
+@pytest.mark.parametrize("token", [None, 123, ["tok"]])
+async def test_lifespan_rejects_non_string_tokens(monkeypatch, token):
+    # str() would turn these into a "token" like "123" or "None".
+    monkeypatch.setenv("CODEBERG_ACCOUNTS", json.dumps({"a": token}))
+    with pytest.raises(RuntimeError, match="token for 'a'"):
+        async with server._lifespan(server.mcp):
+            pass
+
+
+@pytest.mark.parametrize("raw", ['["tok"]', '"tok"', "1"])
+async def test_lifespan_rejects_non_object_accounts(monkeypatch, raw):
+    monkeypatch.setenv("CODEBERG_ACCOUNTS", raw)
+    with pytest.raises(RuntimeError, match="must be a JSON object"):
+        async with server._lifespan(server.mcp):
+            pass
+
+
 async def _noop() -> None:
     return None
 

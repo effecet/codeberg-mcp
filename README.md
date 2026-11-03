@@ -7,7 +7,7 @@
 [![Codeberg](https://img.shields.io/badge/API-Gitea%2FForgejo%20v1-2185D0?logo=codeberg)](https://codeberg.org)
 
 An [MCP](https://modelcontextprotocol.io/) server for **Codeberg** (and any
-Gitea/Forgejo instance) exposing **49 tools** for repos, files, pull requests,
+Gitea/Forgejo instance) exposing **51 tools** for repos, files, pull requests,
 branches, commits, issues, releases, tags, Actions, and repo/account settings —
 with **multi-account** support and a consistent structured error contract.
 
@@ -91,7 +91,7 @@ MCP_TRANSPORT=http PORT=8000 python server.py
 # exposes streamable-HTTP on http://0.0.0.0:8000
 ```
 
-## Tools (49)
+## Tools (51)
 
 | Group | Tools |
 |---|---|
@@ -101,11 +101,19 @@ MCP_TRANSPORT=http PORT=8000 python server.py
 | Branches / commits | `list_branches`, `create_branch`, `get_latest_commit`, `compare_refs` |
 | Issues | `list_issues`, `get_issue`, `create_issue`, `edit_issue`, `comment_on_issue`, `list_issue_labels`, `add_issue_labels`, `remove_issue_label` |
 | Releases / tags | `list_releases`, `get_release`, `get_release_by_tag`, `create_release`, `edit_release`, `list_tags`, `get_tag` |
-| Actions | `list_workflow_runs`, `get_workflow_run`, `get_workflow_logs`, `list_actions_variables`, `get_actions_variable`, `create_actions_variable`, `update_actions_variable` |
+| Actions | `list_workflow_runs`, `get_workflow_run`, `wait_for_runs`, `get_workflow_logs`, `cancel_workflow_run`, `rerun_workflow_run`, `list_runners`, `list_queued_jobs`, `list_actions_variables`, `get_actions_variable`, `create_actions_variable`, `update_actions_variable` |
 | Account / secrets | `list_user_keys`, `list_user_emails`, `list_repo_secrets` |
 
 Every tool accepts an optional `account` parameter to pick which configured
 account (token) to use.
+
+`wait_for_runs` blocks until every Actions run for a commit has finished (up
+to 30 minutes per call) and reports MCP progress while it waits, when the
+client asks for it, so an agent can wait for CI without hand-rolled sleep
+loops. `get_workflow_logs` returns one section per job, keeping the end of
+each log, where the failure usually is. `cancel_workflow_run` and
+`rerun_workflow_run` call endpoints that codeberg.org does not register (they
+return 404 there); they work only on Forgejo/Gitea instances that expose them.
 
 ## Error contract
 
