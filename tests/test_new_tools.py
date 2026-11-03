@@ -262,10 +262,10 @@ async def test_get_workflow_run_uses_direct_endpoint(mcp_client, respx_mock):
     assert result["name"] == "CI"
     assert result["run_number"] == 42
     assert result["url"].endswith("/actions/runs/42")
-    # jobs are not available via API — empty list + _note
+    # jobs are not included here — empty list + _note pointing at get_workflow_logs
     assert result["jobs"] == []
     assert "_note" in result
-    assert "not exposed" in result["_note"]
+    assert "get_workflow_logs" in result["_note"]
 
 
 async def test_get_workflow_run_raises_when_not_found(mcp_client, respx_mock):
@@ -278,26 +278,262 @@ async def test_get_workflow_run_raises_when_not_found(mcp_client, respx_mock):
         await server.get_workflow_run(owner="example", repo="demo-repo", run_id=999)
 
 
-async def test_get_workflow_logs_returns_text(mcp_client, respx_mock):
-    respx_mock.get("/repos/example/demo-repo/actions/tasks/123/logs").mock(
-        return_value=httpx.Response(200, text="line 1\nline 2\nline 3")
+JOBS = "/repos/example/demo-repo/actions/runs/123/jobs"
+
+
+def _job_log(job_id: int) -> str:
+    return f"/repos/example/demo-repo/actions/jobs/{job_id}/logs"
+
+
+async def test_get_workflow_logs_lists_jobs_then_fetches_each_log(
+    mcp_client, respx_mock
+):
+    # /runs/{id}/jobs returns a bare list on Forgejo v12.10 (verified 2026-10-22)
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": 7, "name": "lint", "status": "success"},
+                {"id": 8, "name": "test", "status": "failure"},
+            ],
+        )
     )
+    respx_mock.get(_job_log(7)).mock(return_value=httpx.Response(200, text="lint ok"))
+    respx_mock.get(_job_log(8)).mock(return_value=httpx.Response(200, text="boom"))
     result = await server.get_workflow_logs(
         owner="example", repo="demo-repo", run_id=123
     )
-    assert result == "line 1\nline 2\nline 3"
+    assert result == (
+        "=== job lint (id 7, success) ===\nlint ok\n\n"
+        "=== job test (id 8, failure) ===\nboom"
+    )
 
 
-async def test_get_workflow_logs_truncates_over_max_bytes(mcp_client, respx_mock):
-    huge = "x" * 100000
-    respx_mock.get("/repos/example/demo-repo/actions/tasks/123/logs").mock(
-        return_value=httpx.Response(200, text=huge)
+async def test_get_workflow_logs_with_job_id_skips_the_jobs_listing(
+    mcp_client, respx_mock
+):
+    jobs = respx_mock.get(JOBS).mock(return_value=httpx.Response(200, json=[]))
+    respx_mock.get(_job_log(9)).mock(
+        return_value=httpx.Response(200, text="line 1\nline 2")
+    )
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, job_id=9
+    )
+    assert result == "line 1\nline 2"
+    assert not jobs.called
+
+
+async def test_get_workflow_logs_truncation_keeps_the_tail(mcp_client, respx_mock):
+    # The failing step is at the end of a CI log, so the tail must survive.
+    huge = "x" * 100000 + "FAILED HERE"
+    respx_mock.get(_job_log(9)).mock(return_value=httpx.Response(200, text=huge))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, job_id=9, max_bytes=1000
+    )
+    assert result.endswith("FAILED HERE")
+    assert result.startswith("[truncated — 99011 bytes omitted from the start]")
+    assert len(result.encode("utf-8")) < 1100
+
+
+async def test_get_workflow_logs_gives_unused_budget_to_the_long_log(
+    mcp_client, respx_mock
+):
+    # A short passing job must not starve the long failing one.
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(
+            200, json=[{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+        )
+    )
+    respx_mock.get(_job_log(1)).mock(return_value=httpx.Response(200, text="a" * 100))
+    respx_mock.get(_job_log(2)).mock(
+        return_value=httpx.Response(200, text="b" * 5000 + "B-END")
     )
     result = await server.get_workflow_logs(
         owner="example", repo="demo-repo", run_id=123, max_bytes=1000
     )
-    assert len(result.encode("utf-8")) < 1100
-    assert "[truncated" in result
+    assert "a" * 100 in result  # short log kept whole
+    assert result.endswith("B-END")  # tail kept on the multi-job path
+    # 1000 - 100 left for b's log: 895 b's + "B-END", cut right after the marker
+    assert result.endswith(" omitted from the start]\n" + "b" * 895 + "B-END")
+
+
+async def test_get_workflow_logs_one_missing_log_keeps_the_others(
+    mcp_client, respx_mock
+):
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": 1, "name": "test", "status": "failure"},
+                {"id": 2, "name": "deploy", "status": "skipped"},
+            ],
+        )
+    )
+    respx_mock.get(_job_log(1)).mock(return_value=httpx.Response(200, text="boom"))
+    respx_mock.get(_job_log(2)).mock(return_value=httpx.Response(404, json={}))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123
+    )
+    assert "=== job test (id 1, failure) ===\nboom" in result
+    assert (
+        "=== job deploy (id 2, skipped) ===\n(no log: 404 — not started, skipped, or expired)"
+        in result
+    )
+
+
+async def test_get_workflow_logs_accepts_a_wrapped_jobs_list(mcp_client, respx_mock):
+    # Upstream Gitea returns {"jobs": [...], "total_count": N}
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 4, "name": "ci"},
+                    {"name": "no-id"},
+                    {"id": None},
+                    {"id": True},
+                ]
+            },
+        )
+    )
+    respx_mock.get(_job_log(4)).mock(return_value=httpx.Response(200, text="ok"))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123
+    )
+    assert result == "=== job ci (id 4, ?) ===\nok"
+
+
+async def test_get_workflow_logs_listing_error_is_structured(
+    mcp_client, respx_mock, tool_error
+):
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(500, json={"message": "server broke"})
+    )
+    result = await tool_error(
+        server.get_workflow_logs(owner="example", repo="demo-repo", run_id=123)
+    )
+    assert result["status"] == 500
+    assert "server broke" in result["error"]
+
+
+async def test_get_workflow_logs_job_log_error_is_structured(
+    mcp_client, respx_mock, tool_error
+):
+    # Only a 404 is a benign "no log"; an auth or server error must not be
+    # disguised as a job without logs.
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(200, json=[{"id": 1}, {"id": 2}])
+    )
+    respx_mock.get(_job_log(1)).mock(return_value=httpx.Response(200, text="ok"))
+    respx_mock.get(_job_log(2)).mock(
+        return_value=httpx.Response(403, json={"message": "token expired"})
+    )
+    result = await tool_error(
+        server.get_workflow_logs(owner="example", repo="demo-repo", run_id=123)
+    )
+    assert result["status"] == 403
+    assert "token expired" in result["error"]
+
+
+async def test_get_workflow_logs_job_id_error_is_structured(
+    mcp_client, respx_mock, tool_error
+):
+    respx_mock.get(_job_log(9)).mock(
+        return_value=httpx.Response(500, json={"message": "server broke"})
+    )
+    result = await tool_error(
+        server.get_workflow_logs(
+            owner="example", repo="demo-repo", run_id=123, job_id=9
+        )
+    )
+    assert result["status"] == 500
+
+
+async def test_get_workflow_logs_404_note_is_never_truncated(mcp_client, respx_mock):
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(200, json=[{"id": 1}, {"id": 2}])
+    )
+    respx_mock.get(_job_log(1)).mock(return_value=httpx.Response(200, text="x" * 50))
+    respx_mock.get(_job_log(2)).mock(return_value=httpx.Response(404, json={}))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, max_bytes=2
+    )
+    assert result.endswith("(no log: 404 — not started, skipped, or expired)")
+
+
+async def test_get_workflow_logs_truncation_never_splits_a_character(
+    mcp_client, respx_mock
+):
+    respx_mock.get(_job_log(9)).mock(return_value=httpx.Response(200, text="é" * 600))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, job_id=9, max_bytes=101
+    )
+    body = result.split("\n", 1)[1]
+    assert set(body) == {"é"} and len(body) == 50
+
+
+async def test_get_workflow_logs_tiny_budget_still_returns_every_job(
+    mcp_client, respx_mock
+):
+    respx_mock.get(JOBS).mock(
+        return_value=httpx.Response(200, json=[{"id": 1}, {"id": 2}, {"id": 3}])
+    )
+    for jid in (1, 2, 3):
+        respx_mock.get(_job_log(jid)).mock(return_value=httpx.Response(200, text="xyz"))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, max_bytes=1
+    )
+    assert result.count("=== job ? (id ") == 3
+
+
+async def test_get_workflow_logs_run_with_no_jobs(mcp_client, respx_mock):
+    respx_mock.get(JOBS).mock(return_value=httpx.Response(200, json=[]))
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123
+    )
+    assert result == "Run 123 has no jobs yet."
+
+
+async def test_get_workflow_logs_404_degrades_to_the_run_url(mcp_client, respx_mock):
+    respx_mock.get(JOBS).mock(return_value=httpx.Response(404, json={}))
+    respx_mock.get("/repos/example/demo-repo/actions/runs/123").mock(
+        return_value=httpx.Response(
+            200, json={"id": 123, "html_url": "https://codeberg.org/x/run/123"}
+        )
+    )
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123
+    )
+    assert "No logs found for run_id=123" in result
+    assert "https://codeberg.org/x/run/123" in result
+
+
+async def test_get_workflow_logs_404_falls_back_when_run_lookup_fails(
+    mcp_client, respx_mock
+):
+    # get_workflow_run reports a 5xx as an error dict with no url; the
+    # message must still end in a usable link, not an empty one.
+    respx_mock.get(JOBS).mock(return_value=httpx.Response(404, json={}))
+    respx_mock.get("/repos/example/demo-repo/actions/runs/123").mock(
+        return_value=httpx.Response(500, json={"message": "server broke"})
+    )
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123
+    )
+    assert result.endswith("(filter by run_id=123)")
+
+
+async def test_get_workflow_logs_job_log_404_also_degrades(mcp_client, respx_mock):
+    respx_mock.get(_job_log(9)).mock(return_value=httpx.Response(404, json={}))
+    respx_mock.get("/repos/example/demo-repo/actions/runs/123").mock(
+        return_value=httpx.Response(404, json={})
+    )
+    result = await server.get_workflow_logs(
+        owner="example", repo="demo-repo", run_id=123, job_id=9
+    )
+    assert "No logs found for job_id=9" in result
+    assert "Omit job_id" in result
+    assert "filter by run_id=123" in result
 
 
 # ── issues ─────────────────────────────────────────────────────────────────
