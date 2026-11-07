@@ -24,9 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          # ruff is pinned: an unpinned install turned CI red when a new release
-          # widened the default rules. Bump deliberately (Dependabot cannot see this line).
-          uv pip install 'ruff==0.16.2' -r requirements.txt
+          # ruff is pinned in requirements.txt (the single source of truth, which
+          # Dependabot bumps): an unpinned install turned CI red when a new release
+          # widened the default rules. Don't re-pin it here.
+          uv pip install -r requirements.txt
 
       - name: Ruff format check
         run: uv run ruff format --check .
